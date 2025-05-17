@@ -1,0 +1,197 @@
+require('dotenv').config();
+const express = require('express');
+const bodyParser = require('body-parser');
+const axios = require('axios');
+const { Configuration, OpenAIApi } = require('openai');
+const redis = require('redis');
+const fs = require('fs-extra');
+const path = require('path');
+
+// Initialize Express
+const app = express();
+app.use(bodyParser.json({ limit: '50mb' }));
+const PORT = process.env.PORT || 3000;
+
+// Initialize OpenAI
+const configuration = new Configuration({
+  apiKey: process.env.OPENAI_API_KEY,
+});
+const openai = new OpenAIApi(configuration);
+
+// Initialize Redis
+const client = redis.createClient({
+  host: process.env.REDIS_HOST,
+  port: process.env.REDIS_PORT,
+});
+
+client.on('error', (err) => console.error('Redis error:', err));
+
+// Helper function to get/set conversation history
+const getHistory = async (userId) => {
+  const history = await client.get(userId);
+  return history ? JSON.parse(history) : [];
+};
+
+const setHistory = async (userId, history) => {
+  await client.setex(userId, 3600, JSON.stringify(history)); // 1 hour TTL
+};
+
+// Webhook verification
+app.get('/webhook', (req, res) => {
+  const mode = req.query['hub.mode'];
+  const token = req.query['hub.verify_token'];
+  const challenge = req.query['hub.challenge'];
+
+  if (mode && token === process.env.WHATSAPP_VERIFY_TOKEN) {
+    res.status(200).send(challenge);
+  } else {
+    res.status(403).send('Forbidden');
+  }
+});
+
+// Handle incoming messages
+app.post('/webhook', async (req, res) => {
+  const body = req.body;
+
+  if (body.object) {
+    if (
+      body.entry &&
+      body.entry[0].changes &&
+      body.entry[0].changes[0].value.messages &&
+      body.entry[0].changes[0].value.messages.length > 0
+    ) {
+      const message = body.entry[0].changes[0].value.messages[0];
+      const phone_number_id = body.entry[0].changes[0].value.metadata.phone_number_id;
+      const from = message.from; // WhatsApp user ID
+      const type = message.type;
+
+      let userMessage = '';
+
+      if (type === 'text') {
+        userMessage = message.text.body;
+      } else if (type === 'image' || type === 'audio' || type === 'voice') {
+        const mediaId = message[type].id;
+        const caption = message[type].caption || '';
+        const mediaUrlResponse = await axios.get(`https://graph.facebook.com/v18.0/ ${mediaId}`, {
+          headers: {
+            Authorization: `Bearer ${process.env.WHATSAPP_ACCESS_TOKEN}`,
+          },
+        });
+
+        const { url } = mediaUrlResponse.data;
+        const downloadPath = path.join(__dirname, 'media', `${mediaId}.${type}`);
+
+        // Download media
+        const mediaResponse = await axios.get(url, { responseType: 'stream' });
+        const writer = fs.createWriteStream(downloadPath);
+        mediaResponse.data.pipe(writer);
+
+        await new Promise((resolve, reject) => {
+          writer.on('finish', resolve);
+          writer.on('error', reject);
+        });
+
+        // Send image/audio to OpenAI Vision or transcription model
+        if (type === 'image') {
+          const base64Image = await fs.readFile(downloadPath, { encoding: 'base64' });
+          userMessage = `User sent an image. Caption: "${caption}". Describe what you see in this image.`;
+
+          const gptResponse = await openai.createChatCompletion({
+            model: 'gpt-4-vision-preview',
+            messages: [
+              {
+                role: 'user',
+                content: [
+                  { type: 'text', text: userMessage },
+                  {
+                    type: 'image_url',
+                    image_url: {
+                      url: `data:image/jpeg;base64,${base64Image}`,
+                    },
+                  },
+                ],
+              },
+            ],
+          });
+
+          const reply = gptResponse.data.choices[0].message.content;
+          await sendMessage(phone_number_id, from, reply);
+        } else {
+          // Audio/voice note handling
+          const audioFile = fs.createReadStream(downloadPath);
+          const formData = new FormData();
+          formData.append('file', audioFile, { filename: `${mediaId}.ogg` });
+          formData.append('model', 'whisper-1');
+
+          const whisperRes = await axios.post(
+            'https://api.openai.com/v1/audio/transcriptions ',
+            formData,
+            {
+              headers: {
+                Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+                ...formData.getHeaders(),
+              },
+            }
+          );
+
+          const transcribedText = whisperRes.data.text;
+          const history = await getHistory(from);
+          history.push({ role: 'user', content: `Voice Note: ${transcribedText}` });
+
+          const gptResponse = await openai.createChatCompletion({
+            model: 'gpt-3.5-turbo',
+            messages: history,
+          });
+
+          const reply = gptResponse.data.choices[0].message.content;
+          history.push({ role: 'assistant', content: reply });
+          await setHistory(from, history);
+
+          await sendMessage(phone_number_id, from, reply);
+        }
+
+        // Clean up media files
+        fs.removeSync(downloadPath);
+      } else if (type === 'text') {
+        // Normal text message with history
+        const history = await getHistory(from);
+        history.push({ role: 'user', content: userMessage });
+
+        const gptResponse = await openai.createChatCompletion({
+          model: 'gpt-3.5-turbo',
+          messages: history,
+        });
+
+        const reply = gptResponse.data.choices[0].message.content;
+        history.push({ role: 'assistant', content: reply });
+        await setHistory(from, history);
+
+        await sendMessage(phone_number_id, from, reply);
+      }
+    }
+    res.sendStatus(200);
+  } else {
+    res.sendStatus(404);
+  }
+});
+
+// Helper function to send WhatsApp message
+async function sendMessage(phone_number_id, to, text) {
+  await axios.post(
+    `https://graph.facebook.com/v18.0/ ${phone_number_id}/messages`,
+    {
+      messaging_product: 'whatsapp',
+      to,
+      text: { body: text },
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${process.env.WHATSAPP_ACCESS_TOKEN}`,
+      },
+    }
+  );
+}
+
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
